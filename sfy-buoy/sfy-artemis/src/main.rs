@@ -119,8 +119,8 @@ fn main() -> ! {
             .unwrap(),
     ); // Now timestamps will be positive.
     rtc.enable();
-    rtc.set_alarm_repeat(hal::rtc::AlarmRepeat::CentiSecond);
-    rtc.enable_alarm();
+    //rtc.set_alarm_repeat(hal::rtc::AlarmRepeat::CentiSecond);
+    //rtc.enable_alarm();
 
     let mut location = Location::new();
 
@@ -251,10 +251,10 @@ fn main() -> ! {
         unsafe { IMU = Some(imu) };
     });
 
-    defmt::info!("Enable interrupts");
-    unsafe {
-        cortex_m::interrupt::enable();
-    }
+    //defmt::info!("Enable interrupts");
+    //unsafe {
+    //    cortex_m::interrupt::enable();
+    //}
 
     info!("Entering main loop");
     const GOOD_TRIES: u32 = 15;
@@ -264,8 +264,16 @@ fn main() -> ! {
     #[cfg(feature = "storage")]
     let mut sd_good: bool = true; // Do not spam with log messags.
 
+    #[allow(non_upper_case_globals)]
+    let mut imu: Option<Imu<E, I>> = None;
+    static mut GOODTRIES: u16 = 5;
+
     loop {
         let now = STATE.now().timestamp_millis();
+
+        
+
+        
 
         // Move data to SD card and enqueue for Notecard.
         #[cfg(feature = "storage")]
@@ -378,19 +386,77 @@ fn main() -> ! {
                 }
             };
             last = now;
+        } //If
+
+        // FIFO size of IMU is 512 samples (uncompressed), sample rate at IMU is 208 Hz. So we
+        // need to empty FIFO at atleast (208 / 512) Hz = 0.406 Hz or every 2.46 s.
+
+        // Clear RTC interrupt
+        //unsafe {
+        //    (*(hal::pac::RTC::ptr()))
+        //        .intclr
+        //        .write(|w| w.alm().set_bit());
+        //}
+
+        if let Some(ref mut imu) = imu {
+            let (now, position_time, lon, lat) = free(|cs| {
+                let state = STATE.borrow(cs).borrow();
+                let state = state.as_ref().unwrap();
+
+                let now = state.rtc.now().timestamp_millis();
+                let position_time = state.position_time;
+                let lon = state.lon;
+                let lat = state.lat;
+
+                (now, position_time, lon, lat)
+            });
+
+            COUNT.store((now / 1000).try_into().unwrap_or(0), Ordering::Relaxed);
+
+            // XXX: This is the most time-critical part of the program.
+            //
+            // It seems that the IMU I2C communication sometimes fails with a NAK, causing a module
+            // reset, which again might cause a HardFault.
+            match imu.check_retrieve(now, position_time, lon, lat) {
+                Ok(_) => {
+                    unsafe {
+                        GOODTRIES = 5;
+                    }
+                }
+                Err(e) => {
+                    error!("IMU ISR failed: {:?}, resetting IMU..", e);
+
+                    let mut delay = hal::delay::FlashDelay;
+
+                    let r = imu.reset(now, position_time, lon, lat, &mut delay);
+                    warn!("IMU reset: {:?}", r);
+
+                    let mut msg = heapless::String::<256>::new();
+                    write!(&mut msg, "IMU failure: {:?}, reset: {:?}", e, r)
+                        .inspect_err(|e| {
+                            defmt::error!("failed to format IMU failure: {:?}", defmt::Debug2Format(e))
+                        })
+                        .ok();
+                    log(&msg);
+
+                    if unsafe {GOODTRIES == 0} {
+                        panic!("IMU has failed repeatedly: {:?}, resetting system.", e);
+                    }
+
+                    unsafe {
+                        GOODTRIES -= 1;
+                    }
+                }
+            }
+        } else {
+            unsafe {
+                imu.replace(IMU.take().unwrap());
+            }
         }
-
-        #[cfg(not(feature = "deploy"))]
-        delay.delay_ms(1000u16);
-
-        #[cfg(feature = "deploy")]
-        asm::wfi(); // doesn't work very well with RTT + probe
-
-        // defmt::flush();
-
-        // TODO:
-        // * Set up and feed watchdog.
-    }
+        
+        
+        delay.delay_ms(1u16);
+    } //loop
 }
 
 fn reset<I: Read + Write>(note: &mut Notecarrier<I>, delay: &mut impl DelayMs<u16>) -> ! {
@@ -409,7 +475,7 @@ fn reset<I: Read + Write>(note: &mut Notecarrier<I>, delay: &mut impl DelayMs<u1
 
     cortex_m::peripheral::SCB::sys_reset()
 }
-
+/* 
 #[cfg(not(feature = "host-tests"))]
 #[allow(non_snake_case)]
 #[interrupt]
@@ -480,7 +546,7 @@ fn RTC() {
         }
     }
 }
-
+*/
 #[allow(non_snake_case)]
 #[exception]
 unsafe fn HardFault(ef: &ExceptionFrame) -> ! {
